@@ -68,27 +68,122 @@ class StartupGuardError(RuntimeError):
 class SafetyCheckError(RuntimeError):
     pass
 
-def on_press(key):
+_KEY_TO_TELEOP_ACTION = {
+    'r': 'start',
+    'q': 'stop',
+    's': 'record_start',
+    't': 'record_stop',
+    'p': 'record_transfer',
+}
+
+def request_teleop_action(action: str, source: str = "Keyboard"):
+    """Unified teleop control: keyboard, IPC (via on_press), and XR controller shortcuts."""
     global STOP, START, RECORD_START_REQUEST, RECORD_STOP_REQUEST, RECORD_TRANSFER_REQUEST
-    key = str(key).lower()
-    if key == 'r':
+    if action == 'start':
         START = True
-        logger_mp.info("[Keyboard] r pressed: start tracking requested.")
-    elif key == 'q':
+        logger_mp.info("[%s] start tracking requested.", source)
+    elif action == 'stop':
         START = False
         STOP = True
-        logger_mp.info("[Keyboard] q pressed: safe shutdown requested.")
-    elif key == 's' and START == True:
-        RECORD_START_REQUEST = True
-        logger_mp.info("[Keyboard] s pressed: record start requested.")
-    elif key == 't' and START == True:
-        RECORD_STOP_REQUEST = True
-        logger_mp.info("[Keyboard] t pressed: record stop/save requested.")
-    elif key == 'p':
+        logger_mp.info("[%s] safe shutdown requested.", source)
+    elif action == 'record_start':
+        if START:
+            RECORD_START_REQUEST = True
+            logger_mp.info("[%s] record start requested.", source)
+        else:
+            logger_mp.warning("[%s] record start ignored: tracking not started yet (press r / Left A first).", source)
+    elif action == 'record_stop':
+        if START:
+            RECORD_STOP_REQUEST = True
+            logger_mp.info("[%s] record stop/save requested.", source)
+        else:
+            logger_mp.warning("[%s] record stop ignored: tracking not started yet.", source)
+    elif action == 'record_transfer':
         RECORD_TRANSFER_REQUEST = True
-        logger_mp.info("[Keyboard] p pressed: transfer completed G1 episodes requested.")
+        logger_mp.info("[%s] transfer completed G1 episodes requested.", source)
     else:
-        logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
+        logger_mp.warning("[%s] unknown teleop action: %s", source, action)
+
+def on_press(key):
+    key = str(key).lower()
+    action = _KEY_TO_TELEOP_ACTION.get(key)
+    if action:
+        request_teleop_action(action, "Keyboard")
+    else:
+        logger_mp.warning("[Keyboard] %s was pressed, but no action is defined for this key.", key)
+
+class _ControllerShortcutState:
+    """Edge detection and Right-B short (record start) vs long (transfer) press handling."""
+
+    def __init__(self):
+        self._prev_buttons = {}
+        self._right_b_pressed_at = None
+        self._right_b_long_press_fired = False
+
+    def reset_right_b(self):
+        self._right_b_pressed_at = None
+        self._right_b_long_press_fired = False
+
+    def _rising_edge(self, name: str, pressed: bool) -> bool:
+        prev = self._prev_buttons.get(name, False)
+        self._prev_buttons[name] = pressed
+        return pressed and not prev
+
+    def update(self, tele_data, *, allow_record_actions: bool, long_press_s: float):
+        if self._rising_edge('left_a', tele_data.left_ctrl_aButton):
+            request_teleop_action('start', 'Controller')
+        if self._rising_edge('right_a', tele_data.right_ctrl_aButton):
+            request_teleop_action('stop', 'Controller')
+        if allow_record_actions and self._rising_edge('left_b', tele_data.left_ctrl_bButton):
+            request_teleop_action('record_stop', 'Controller')
+
+        right_b = tele_data.right_ctrl_bButton
+        now = time.monotonic()
+        if right_b:
+            if self._right_b_pressed_at is None:
+                self._right_b_pressed_at = now
+                self._right_b_long_press_fired = False
+            elif (
+                allow_record_actions
+                and not self._right_b_long_press_fired
+                and (now - self._right_b_pressed_at) >= long_press_s
+            ):
+                request_teleop_action('record_transfer', 'Controller')
+                logger_mp.info(
+                    "[Controller] right B held %.1fs: episode transfer (p) requested.",
+                    long_press_s,
+                )
+                self._right_b_long_press_fired = True
+        elif self._right_b_pressed_at is not None:
+            held_s = now - self._right_b_pressed_at
+            if allow_record_actions and not self._right_b_long_press_fired and held_s < long_press_s:
+                request_teleop_action('record_start', 'Controller')
+                logger_mp.info(
+                    "[Controller] right B short press (%.2fs): record start (s) requested.",
+                    held_s,
+                )
+            self.reset_right_b()
+
+def _controller_shortcuts_enabled(args) -> bool:
+    return args.input_mode == 'controller' and not args.no_controller_shortcuts
+
+def _log_teleop_control_hints(args):
+    logger_mp.info("----------------------------------------------------------------")
+    logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+    if args.record:
+        logger_mp.info("🟡  Press [s] to START recording, [t] to STOP and SAVE recording, [p] to PULL completed G1 episodes.")
+    else:
+        logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
+    logger_mp.info("🔴  Press [q] to stop and exit the program.")
+    if _controller_shortcuts_enabled(args):
+        logger_mp.info("🎮  Controller shortcuts (same as keys above):")
+        logger_mp.info("     Left A (X) → start (r)  |  Right A → quit (q)")
+        logger_mp.info("     Right B short release → record START (s)  |  Left B (Y) → record STOP (t)")
+        logger_mp.info(
+            "     Right B hold ≥%.1fs → pull G1 episodes (p)",
+            args.controller_right_b_long_press_s,
+        )
+    logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
 
 def _listen_keyboard_safe():
     try:
@@ -377,6 +472,8 @@ if __name__ == '__main__':
     # basic control parameters
     parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
+    parser.add_argument('--no-controller-shortcuts', action='store_true', help='Disable XR controller button mapping to teleop actions (keyboard/IPC still work).')
+    parser.add_argument('--controller-right-b-long-press-s', type=float, default=2.0, help='Right B hold duration (seconds) to trigger episode transfer (p) in controller mode.')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'dex3_true', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
@@ -430,6 +527,8 @@ if __name__ == '__main__':
         parser.error("--record-transfer-bwlimit-kbps must be greater than or equal to 0.")
     if args.g1_record_max_pending_items < 0:
         parser.error("--g1-record-max-pending-items must be greater than or equal to 0.")
+    if args.controller_right_b_long_press_s <= 0.0:
+        parser.error("--controller-right-b-long-press-s must be greater than 0.")
     logger_mp.info(f"args: {args}")
     use_g1_record = args.record and args.record_backend == 'g1'
 
@@ -625,20 +724,26 @@ if __name__ == '__main__':
         if not args.skip_ready_pose:
             _ease_arm_to_home(arm_ctrl, args.ready_transition_time, args.frequency, label="Ready Pose")
 
-        logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
-        if args.record:
-            logger_mp.info("🟡  Press [s] to START recording, [t] to STOP and SAVE recording, [p] to PULL completed G1 episodes.")
-        else:
-            logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
-        logger_mp.info("🔴  Press [q] to stop and exit the program.")
-        logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        _log_teleop_control_hints(args)
+        controller_shortcut_state = (
+            _ControllerShortcutState() if _controller_shortcuts_enabled(args) else None
+        )
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
+            if controller_shortcut_state is not None:
+                wait_tele_data = tv_wrapper.get_tele_data()
+                controller_shortcut_state.update(
+                    wait_tele_data,
+                    allow_record_actions=False,
+                    long_press_s=args.controller_right_b_long_press_s,
+                )
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 tv_wrapper.render_to_xr(head_img)
+
+        if controller_shortcut_state is not None:
+            controller_shortcut_state.reset_right_b()
 
         if STOP:
             logger_mp.info("Stop requested before tracking started.")
@@ -923,11 +1028,13 @@ if __name__ == '__main__':
             else:
                 pass
             
-            # high level control
-            if args.input_mode == "controller" and tele_data.right_ctrl_aButton:
-                START = False
-                STOP = True
-                logger_mp.info("[Controller] right A pressed: safe shutdown requested.")
+            # high level control (keyboard/IPC use on_press; controller uses edge + long-press mapping)
+            if controller_shortcut_state is not None:
+                controller_shortcut_state.update(
+                    tele_data,
+                    allow_record_actions=True,
+                    long_press_s=args.controller_right_b_long_press_s,
+                )
 
             if args.input_mode == "controller" and args.motion:
                 # command robot to enter damping mode. soft emergency stop function
